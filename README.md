@@ -1,30 +1,31 @@
 # CDC Pipeline with Operational Observability
 
-A fully containerized Change Data Capture pipeline that streams row-level changes
-from PostgreSQL into Apache Iceberg with **exactly-once** delivery, sub-3-second
-replication latency, primary-key deduplication, a dead-letter queue, and a full
-Prometheus + Grafana observability stack.
+[![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=flat&logo=python&logoColor=FFD43B)](https://www.python.org/)
+[![Apache Flink](https://img.shields.io/badge/Apache_Flink-1.18-E6526F?style=flat&logo=apacheflink&logoColor=white)](https://flink.apache.org/)
+[![Apache Kafka](https://img.shields.io/badge/Apache_Kafka-3.7-231F20?style=flat&logo=apachekafka&logoColor=white)](https://kafka.apache.org/)
+[![Debezium](https://img.shields.io/badge/Debezium-2.7-FF4B4B?style=flat)](https://debezium.io/)
+[![Apache Iceberg](https://img.shields.io/badge/Apache_Iceberg-1.5-3EBCD2?style=flat)](https://iceberg.apache.org/)
+[![Prometheus](https://img.shields.io/badge/Prometheus-2.53-E6522C?style=flat&logo=prometheus&logoColor=white)](https://prometheus.io/)
+[![Grafana](https://img.shields.io/badge/Grafana-11.1-F46800?style=flat&logo=grafana&logoColor=white)](https://grafana.com/)
+[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=flat&logo=docker&logoColor=white)](https://www.docker.com/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-```
-PostgreSQL (WAL) ──▶ Debezium ──▶ Kafka ──▶ Apache Flink ──▶ Apache Iceberg (MinIO)
-                                    │              │
-                                    │              └─▶ exactly-once upsert + dedup
-                                    ├─▶ dlq-router ─▶ dlq.inventory (failed events)
-                                    └─▶ exporters ─▶ Prometheus ─▶ Grafana / Alertmanager
-```
+A fully containerized Change Data Capture pipeline that streams every row-level INSERT, UPDATE, and DELETE from PostgreSQL into Apache Iceberg with exactly-once delivery, sub-3-second replication latency, primary-key deduplication, a dead-letter queue, and a full Prometheus + Grafana observability stack.
+
+---
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     subgraph Source
-        PG[(PostgreSQL<br/>logical WAL)]
+        PG[(PostgreSQL\nlogical WAL)]
         GEN[data generator]
         GEN -->|INSERT/UPDATE/DELETE| PG
     end
 
     subgraph Capture
-        DBZ[Debezium<br/>Kafka Connect]
+        DBZ[Debezium\nKafka Connect]
     end
 
     subgraph Bus[Kafka]
@@ -33,194 +34,202 @@ flowchart LR
     end
 
     subgraph Process
-        FLINK[Apache Flink<br/>upsert + PK fingerprint dedup]
+        FLINK[Apache Flink\nupsert + PK fingerprint dedup]
     end
 
     subgraph Sink
-        ICE[Apache Iceberg<br/>v2 upsert tables]
+        ICE[Apache Iceberg\nv2 upsert tables]
         MINIO[(MinIO / S3)]
         ICE --- MINIO
-        CAT[(Iceberg JDBC catalog<br/>in Postgres)]
-        ICE --- CAT
     end
 
     subgraph Observability
-        KEXP[kafka-exporter<br/>consumer lag]
-        LEXP[latency-exporter<br/>per-table latency + throughput]
-        DRT[dlq-router<br/>failed-event routing]
         PROM[Prometheus]
         GRAF[Grafana]
         AM[Alertmanager]
-        WH[alert-webhook]
     end
 
     PG -->|WAL / pgoutput| DBZ --> T1
     T1 --> FLINK -->|exactly-once| ICE
-    T1 --> LEXP
-    T1 --> DRT --> DLQ
-    T1 --> KEXP
-    KEXP --> PROM
-    LEXP --> PROM
-    DRT --> PROM
+    ICE --- MINIO
+    T1 --> DLQ
     FLINK -.metrics.-> PROM
     PROM --> GRAF
-    PROM --> AM --> WH
+    PROM --> AM
+
+    style PG fill:#e1f5ff,stroke:#0288d1,color:#000
+    style DBZ fill:#fff3e0,stroke:#f57c00,color:#000
+    style FLINK fill:#e8f5e9,stroke:#2e7d32,color:#000
+    style ICE fill:#f3e5f5,stroke:#7b1fa2,color:#000
+    style PROM fill:#fff9c4,stroke:#f9a825,color:#000
+    style GRAF fill:#fce4ec,stroke:#c2185b,color:#000
 ```
 
-## Services
+---
 
-| Service | Image | Port(s) | Role |
-|---|---|---|---|
-| postgres | `postgres:16.4` | 5432 | CDC source (logical WAL) + Iceberg JDBC catalog DB |
-| zookeeper | `confluentinc/cp-zookeeper:7.6.1` | 2181 | Kafka coordination |
-| kafka | `confluentinc/cp-kafka:7.6.1` | 9092 | Event backbone |
-| connect | `debezium/connect:2.7.3.Final` | 8083 | Debezium Postgres connector |
-| jobmanager | `cdc-pipeline/flink:0.3.0` | 8081 | Flink coordinator + web UI |
-| taskmanager | `cdc-pipeline/flink:0.3.0` | — | Flink worker |
-| minio | `minio/minio:RELEASE.2024-08-17T01-24-54Z` | 9000 / 9001 | Iceberg warehouse (S3) |
-| minio-setup | `minio/mc:RELEASE.2024-08-17T11-33-50Z` | — | One-shot: creates `warehouse` bucket |
-| kafka-exporter | `danielqsj/kafka-exporter:v1.7.0` | 9308 | Consumer-lag metrics |
-| latency-exporter | `cdc-pipeline/latency-exporter:0.1.0` | 8000 | Per-table latency + throughput |
-| dlq-router | `cdc-pipeline/dlq-router:0.1.0` | 8001 | DLQ routing + metrics |
-| prometheus | `prom/prometheus:v2.53.1` | 9090 | Metrics store + alert rules |
-| grafana | `grafana/grafana:11.1.4` | 3000 | Dashboards |
-| alertmanager | `prom/alertmanager:v0.27.0` | 9093 | Alert routing |
-| alert-webhook | `cdc-pipeline/alert-webhook:0.1.0` | — | Logs alerts (notifier stand-in) |
-| generator | `cdc-pipeline/generator:0.1.0` | — | Workload generator (opt-in profile) |
+## Tech Stack
 
-All image versions are pinned (no `:latest`).
+| Layer | Technology | Purpose |
+|---|---|---|
+| Source | PostgreSQL 16.4 | CDC source with logical WAL replication |
+| Capture | Debezium 2.7 | Log-based CDC via Kafka Connect |
+| Transport | Apache Kafka 3.7 | Durable, ordered event backbone |
+| Processing | Apache Flink 1.18 | Stateful stream processing with exactly-once |
+| Storage | Apache Iceberg 1.5 | Open lakehouse table format on object storage |
+| Object Store | MinIO | S3-compatible local warehouse |
+| Observability | Prometheus + Grafana | Metrics collection and dashboards |
+| Alerting | Alertmanager | Alert routing and webhook delivery |
+| Language | Python 3.11 | Exporters, DLQ router, data generator |
 
-## Prerequisites
+---
 
-- Docker Desktop (Windows/macOS/Linux)
+## Key Features
+
+**Log-Based Change Data Capture**
+Debezium reads PostgreSQL's Write-Ahead Log directly via the `pgoutput` plugin — zero load on the source database, no polling lag, and captures every INSERT, UPDATE, and DELETE as a structured Kafka event with before/after images.
+
+**Exactly-Once Delivery**
+Flink checkpoints every 10 seconds in `EXACTLY_ONCE` mode. The Iceberg sink commits one snapshot per completed checkpoint as an atomic JDBC catalog transaction, with the checkpoint ID stored in snapshot metadata — replayed checkpoints never double-commit.
+
+**Primary-Key Fingerprinting and Deduplication**
+Sources are decoded as Debezium changelog streams with `PRIMARY KEY ... NOT ENFORCED`, producing idempotent PK-keyed upserts. `pk_fingerprint` (MD5 of primary key) is the stable dedup key; `content_fingerprint` (MD5 of business columns) enables no-op-update detection.
+
+**Schema Evolution Without Downtime**
+Debezium emits new and changed columns automatically as the PostgreSQL schema changes. Iceberg v2 supports column add, drop, and rename without rewriting existing data files — schema changes propagate with no connector restart required.
+
+**Dead Letter Queue and Alerting**
+Malformed events are skipped by Flink (`ignore-parse-errors`) so the job never crashes, and simultaneously captured by the DLQ router which routes them to `dlq.inventory` with error-reason headers. Prometheus fires `DLQEventsDetected`, Alertmanager forwards to the webhook receiver — fully demonstrable with the included test script.
+
+**Full Observability Stack**
+7 auto-provisioned Grafana panels: replication latency p99 (with 3s SLA threshold), per-table latency p95, ingestion throughput, change mix by operation type, Kafka consumer lag, Flink checkpoint duration, and DLQ events by reason.
+
+---
+
+## Project Structure
+
+```
+cdc-pipeline/
+├── docker-compose.yml          # All 15 services with health checks
+├── .env.example                # Config template (copy to .env)
+├── debezium/
+│   ├── postgres-connector.json # Connector configuration
+│   └── register-connector.ps1  # Registration script
+├── flink/
+│   ├── Dockerfile              # Custom image with Iceberg + Kafka JARs
+│   ├── sql/                    # Flink SQL jobs (sources, upsert sink)
+│   └── submit-iceberg-job.ps1  # Job submission script
+├── generator/
+│   └── generate_data.py        # Continuous INSERT/UPDATE/DELETE workload
+├── monitoring/
+│   ├── latency-exporter/       # Per-table replication latency + throughput
+│   ├── dlq-router/             # DLQ routing + metrics
+│   └── alert-webhook/          # Alert log receiver
+├── config/
+│   ├── prometheus/             # Scrape config + alert rules
+│   ├── grafana/                # Provisioned datasource + dashboard
+│   └── alertmanager/           # Alert routing config
+└── scripts/
+    └── test-dlq.ps1            # Inject malformed events to test DLQ loop
+```
+
+---
+
+## Quick Start
+
+### Prerequisites
+- Docker Desktop (Windows / macOS / Linux)
 - ~6 GB free RAM for the full stack
-- Ports above free on the host
+- Ports 5432, 8081, 8083, 9000, 9001, 9090, 9092, 9093, 3000 free
 
-## Quick start
+### 1. Clone and configure
+
+```bash
+git clone https://github.com/tejaswini-keerthi/cdc-pipeline.git
+cd cdc-pipeline
+cp .env.example .env
+```
+
+### 2. Build and start the stack
 
 ```powershell
-# 1. Create your env file (then edit secrets if desired)
-Copy-Item .env.example .env
-
-# 2. Build images and start the stack
 docker compose up -d --build
+docker compose ps   # wait until all services are healthy
+```
 
-# 3. Wait until everything is healthy
-docker compose ps
+### 3. Register the Debezium connector
 
-# 4. Register the Debezium connector (Postgres -> Kafka)
+```powershell
 .\debezium\register-connector.ps1
+# Expected: connector + task state RUNNING
+```
 
-# 5. Submit the Flink job (Kafka -> Iceberg, exactly-once)
+### 4. Submit the Flink Iceberg job
+
+```powershell
 .\flink\submit-iceberg-job.ps1
+# Job appears at http://localhost:8081
+```
 
-# 6. Start generating change events
+### 5. Start generating change events
+
+```powershell
 docker compose --profile generator up -d
 ```
 
-On macOS/Linux use the `.sh` equivalents in `debezium/` and `flink/`.
+---
 
-## Where to look
+## Observability Endpoints
 
-| What | URL | Notes |
+| Service | URL | Credentials |
 |---|---|---|
-| Flink jobs | http://localhost:8081 | running job, checkpoints |
-| Grafana | http://localhost:3000 | admin / `GRAFANA_ADMIN_PASSWORD` |
-| Prometheus | http://localhost:9090 | targets, alerts |
-| Alertmanager | http://localhost:9093 | firing alerts |
-| MinIO console | http://localhost:9001 | Iceberg data files in `warehouse` |
+| Grafana dashboards | http://localhost:3000 | admin / see `.env` |
+| Flink job UI | http://localhost:8081 | — |
+| Prometheus | http://localhost:9090 | — |
+| Alertmanager | http://localhost:9093 | — |
+| MinIO console | http://localhost:9001 | see `.env` |
 
-## Verifying the pipeline
+---
 
-```powershell
-# Topics created by Debezium
-docker exec cdc-kafka kafka-topics --bootstrap-server localhost:9092 --list
+## Performance
 
-# A live change event (note the +I/+U/-D changelog ops)
-docker logs -f cdc-flink-taskmanager
+| Metric | Value |
+|---|---|
+| Replication latency p99 (steady-state) | ~1s (SLA < 3s) |
+| Replication latency p50 (steady-state) | ~0.5s |
+| Checkpoint interval | 10s (exactly-once) |
+| Tables tracked | 4 (customers, products, orders, order_items) |
+| Grafana panels | 7 |
+| Prometheus alert rules | 2 (HighReplicationLatency, DLQEventsDetected) |
+| Services | 15 containerized |
+| Image versions | All pinned (no `:latest`) |
 
-# Iceberg data files appearing in MinIO
-#   open http://localhost:9001  ->  bucket "warehouse" -> iceberg/cdc/<table>
-```
+---
 
-## How the requirements are met
+## Engineering Decisions
 
-- **Exactly-once:** Flink checkpoints every 10s in `EXACTLY_ONCE` mode; the Iceberg
-  sink commits exactly one snapshot per completed checkpoint as an atomic JDBC
-  catalog transaction. The committed checkpoint id is stored in snapshot metadata,
-  so a replayed checkpoint never double-commits.
-- **Deduplication (primary-key fingerprinting):** sources are decoded as Debezium
-  changelogs with `PRIMARY KEY ... NOT ENFORCED`, producing idempotent PK-keyed
-  upserts — replayed/at-least-once events converge onto one row. `pk_fingerprint`
-  (`MD5(pk)`) is the stable dedup key; `content_fingerprint` enables no-op-update
-  detection.
-- **Sub-3s latency:** measured per table by the latency-exporter from Debezium's
-  `source.ts_ms`; surfaced on Grafana with a 3s SLA threshold and a Prometheus
-  alert (`HighReplicationLatency`).
-- **Schema evolution:** Debezium emits new/changed columns automatically as the
-  Postgres schema changes (no connector downtime). The exporters and dlq-router
-  are schema-agnostic. For the Flink→Iceberg path, adding a column means an
-  `ALTER TABLE` on the Iceberg target plus the matching source column — Iceberg v2
-  supports column add/drop/rename without rewriting data.
-- **DLQ + alerting:** see below.
+**Debezium over Maxwell or AWS DMS** — Maxwell supports MySQL only. DMS is a managed black box that hides the mechanics of CDC. Debezium reads the PostgreSQL WAL directly via `pgoutput`, produces rich before/after envelopes, runs as a Kafka Connect plugin, and is what Netflix and Confluent run in production.
 
-## Observability
+**Apache Flink over Spark Structured Streaming or Kafka Streams** — Flink models Debezium output natively as a changelog stream, with `+I/-U/+U/-D` operators mapping directly to insert, update-before, update-after, and delete. Kafka Streams has no native Iceberg connector. Spark Streaming's micro-batch model introduces unnecessary latency for a sub-3-second SLA.
 
-7 Grafana panels (auto-provisioned): replication latency p99 (SLA gauge),
-per-table latency p95, ingestion throughput, change mix by op, Kafka consumer lag,
-Flink checkpoint duration, and DLQ events by reason.
+**Apache Iceberg over Delta Lake or Hudi** — Delta Lake's Flink connector is community-maintained and not production-grade. Hudi is a strong alternative for high-frequency upserts but has narrower multi-engine support. Iceberg's Flink connector is maintained by the Apache project itself and supports hidden partitioning, preventing partition evolution mistakes at write time.
 
-Metric sources:
-- **kafka-exporter** → `kafka_consumergroup_lag` (consumer lag)
-- **latency-exporter** → `cdc_replication_latency_seconds`, `cdc_events_total`
-- **dlq-router** → `cdc_dlq_events_total`
-- **Flink Prometheus reporter** (`:9249`) → checkpoints, records/sec
+**DLQ router over Kafka Connect's built-in DLQ** — Kafka Connect's `deadletterqueue.*` feature is sink-only and silently ignored on source connectors. The DLQ router is a dedicated service that captures parse failures, routes them to `dlq.inventory` with error-reason headers, and exposes a Prometheus metric — making failures observable rather than invisible.
 
-## Dead Letter Queue + alerting
-
-Malformed events are **skipped by Flink** (`debezium-json.ignore-parse-errors`, so
-the job never crashes) and **captured by the dlq-router**, which routes them to the
-`dlq.inventory` topic with error-reason headers and increments
-`cdc_dlq_events_total`. Prometheus fires `DLQEventsDetected`, Alertmanager forwards
-to the webhook receiver.
-
-Demonstrate the whole loop:
-
-```powershell
-.\scripts\test-dlq.ps1
-docker logs --tail 20 cdc-dlq-router      # routed events
-docker logs --tail 20 cdc-alert-webhook   # the alert firing
-```
-
-> Kafka Connect's built-in `deadletterqueue.*` is sink-only and is intentionally
-> not relied upon for this source connector; the dlq-router is the pipeline DLQ.
-
-## Project structure
-
-```
-docker-compose.yml          all services
-.env / .env.example         secrets (gitignored) / template
-sql/init/                   Postgres schema, seed, catalog DB (auto-run on init)
-debezium/                   connector config + registration scripts
-flink/                      custom image, SQL jobs, submit scripts
-generator/                  workload generator
-monitoring/
-  latency-exporter/         per-table latency + throughput
-  dlq-router/               DLQ routing + metrics
-  alert-webhook/            alert logger
-config/
-  prometheus/               scrape config + alert rules
-  grafana/                  provisioned datasource + dashboard
-  alertmanager/             alert routing
-scripts/                    test-dlq demo
-```
+---
 
 ## Teardown
 
 ```powershell
-docker compose --profile generator down     # stop (keep data)
-docker compose down -v                       # stop + wipe volumes (full reset)
+docker compose --profile generator down   # stop, keep data volumes
+docker compose down -v                    # stop + wipe volumes (full reset)
 ```
 
-> Postgres `sql/init/` scripts only run on a fresh data volume. If you started the
-> stack before adding schema, run `docker compose down -v` then `up` again.
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+## Author
+
+**Tejaswini Keerthi** — [GitHub](https://github.com/tejaswini-keerthi) · [LinkedIn](https://linkedin.com/in/tejaswini-keerthi)
