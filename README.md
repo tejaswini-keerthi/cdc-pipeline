@@ -212,13 +212,13 @@ docker compose --profile generator up -d
 
 ## Observability Endpoints
 
-| Service | URL | Credentials |
-|---|---|---|
-| Grafana dashboards | http://localhost:3000 | admin / see `.env` |
+| Service | URL |
+|---|---|
+| Grafana dashboards | http://localhost:3000 | 
 | Flink job UI | http://localhost:8081 | — |
 | Prometheus | http://localhost:9090 | — |
 | Alertmanager | http://localhost:9093 | — |
-| MinIO console | http://localhost:9001 | see `.env` |
+| MinIO console | http://localhost:9001 | 
 
 ---
 
