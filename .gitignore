@@ -3,6 +3,9 @@
 # Rendered SQL with injected credentials
 flink/sql/.gen/
 
+# Local Claude Code settings (machine-specific)
+.claude/
+
 # Python
 __pycache__/
 *.pyc

@@ -67,6 +67,38 @@ flowchart LR
 
 ---
 
+## Screenshots
+
+**Flink dashboard — running CDC job**
+
+The four CDC upserts run as a single Flink job, consuming the Debezium topics and
+writing to Iceberg.
+
+![Flink overview showing the running CDC job](docs/images/flink-overview.png)
+
+**Flink job detail — operators and checkpoints**
+
+Per-operator throughput and the checkpoint history that drives exactly-once Iceberg
+commits (one snapshot per completed checkpoint).
+
+![Flink job detail with operator graph and checkpoint stats](docs/images/flink-job-detail.png)
+
+**Grafana — pipeline observability**
+
+Per-table replication latency (p99 against the 3s SLA), ingestion throughput,
+change mix by op, Kafka consumer lag, checkpoint duration, and DLQ events.
+
+![Grafana CDC pipeline dashboard](docs/images/grafana-dashboard.png)
+
+**MinIO — Iceberg warehouse**
+
+Parquet data and equality-delete files committed to the `warehouse` bucket under
+`iceberg/cdc/<table>/`, one set per checkpoint.
+
+![MinIO console showing the Iceberg warehouse bucket](docs/images/minio-warehouse.png)
+
+---
+
 ## Tech Stack
 
 | Layer | Technology | Purpose |
