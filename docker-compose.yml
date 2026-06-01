@@ -1,0 +1,414 @@
+# CDC Pipeline — full stack
+# PostgreSQL (WAL) -> Debezium (Kafka Connect) -> Kafka -> Flink -> Iceberg (MinIO)
+# Observability: Prometheus + Grafana
+#
+# Image versions are pinned to specific stable tags (no :latest) for reproducibility.
+
+name: cdc-pipeline
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — CDC source. Logical WAL is required for Debezium decoding.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16.4
+    container_name: cdc-postgres
+    hostname: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    # Enable logical decoding so Debezium can reconstruct row-level changes.
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"        # emit enough WAL detail for logical replication
+      - "-c"
+      - "max_wal_senders=10"       # allow up to 10 concurrent WAL sender processes
+      - "-c"
+      - "max_replication_slots=10" # one slot per Debezium connector, with headroom
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Schema + seed scripts run automatically on FIRST init (empty data dir).
+      - ./sql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # Zookeeper — cluster coordination/metadata store for Kafka.
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: cdc-zookeeper
+    hostname: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181   # port Kafka dials to reach Zookeeper
+      ZOOKEEPER_TICK_TIME: 2000     # base heartbeat unit in ms
+    healthcheck:
+      # TCP probe of the client port. (The 'ruok' 4lw needs a whitelist that
+      # Confluent's env->config converter can't set — keys starting with a digit
+      # are dropped — so a port check is the reliable liveness signal here.)
+      test: ["CMD-SHELL", "nc -z localhost 2181 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # Kafka — event backbone. Single-broker dev setup with two listeners.
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: cdc-kafka
+    hostname: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"   # host-facing listener
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Two listeners: containers use kafka:29092, the host uses localhost:9092.
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Single broker -> all replication/min-ISR factors must be 1, not the default 3.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # Kafka Connect + Debezium — captures Postgres WAL changes into Kafka topics.
+  # debezium/connect ships the Postgres connector plugin pre-installed.
+  # ---------------------------------------------------------------------------
+  connect:
+    image: debezium/connect:2.7.3.Final
+    container_name: cdc-connect
+    hostname: connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8083:8083"   # Connect REST API (used to register connectors)
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: cdc-connect-cluster
+      # Connect persists config/offsets/status in these Kafka topics for restart safety.
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8083/connectors || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # Flink JobManager — coordinates jobs, schedules tasks, hosts the web UI.
+  # ---------------------------------------------------------------------------
+  jobmanager:
+    build:
+      context: ./flink
+    image: cdc-pipeline/flink:0.3.0
+    container_name: cdc-flink-jobmanager
+    hostname: jobmanager
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"   # Flink web dashboard / REST API
+    command: jobmanager
+    environment:
+      # TaskManagers and clients discover the JobManager via this address.
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        state.backend: hashmap
+        execution.checkpointing.interval: 10s
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
+    volumes:
+      - ./flink/sql:/opt/flink/sql:ro   # SQL job scripts, run via sql-client
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/overview || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # Flink TaskManager — the worker that actually runs the upsert/dedup operators.
+  # ---------------------------------------------------------------------------
+  taskmanager:
+    build:
+      context: ./flink
+    image: cdc-pipeline/flink:0.3.0
+    container_name: cdc-flink-taskmanager
+    hostname: taskmanager
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.backend: hashmap
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # MinIO — S3-compatible object store; serves as the Iceberg warehouse.
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2024-08-17T01-24-54Z
+    container_name: cdc-minio
+    hostname: minio
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # MinIO setup — one-shot: creates the Iceberg 'warehouse' bucket, then exits.
+  # MinIO does not auto-create buckets, so the Iceberg sink needs this first.
+  # ---------------------------------------------------------------------------
+  minio-setup:
+    image: minio/mc:RELEASE.2024-08-17T11-33-50Z
+    container_name: cdc-minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing local/warehouse &&
+      echo 'Bucket warehouse ready' &&
+      exit 0
+      "
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # kafka-exporter — exposes consumer-group lag (Flink's flink-cdc-* groups).
+  # Reads offsets straight from Kafka; no app instrumentation needed.
+  # ---------------------------------------------------------------------------
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    container_name: cdc-kafka-exporter
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - "--kafka.server=kafka:29092"
+    ports:
+      - "9308:9308"   # /metrics
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # latency-exporter — custom: per-table replication latency + throughput.
+  # Reads Debezium source.ts_ms from the CDC topics (see monitoring/latency-exporter).
+  # ---------------------------------------------------------------------------
+  latency-exporter:
+    build: ./monitoring/latency-exporter
+    image: cdc-pipeline/latency-exporter:0.1.0
+    container_name: cdc-latency-exporter
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      EXPORTER_PORT: 8000
+    ports:
+      - "8000:8000"   # /metrics
+    restart: unless-stopped
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # dlq-router — validates CDC events, routes malformed ones to dlq.inventory,
+  # and exposes DLQ metrics. The pipeline's dead letter queue (see monitoring/).
+  # ---------------------------------------------------------------------------
+  dlq-router:
+    build: ./monitoring/dlq-router
+    image: cdc-pipeline/dlq-router:0.1.0
+    container_name: cdc-dlq-router
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      DLQ_TOPIC: dlq.inventory
+      EXPORTER_PORT: 8001
+    ports:
+      - "8001:8001"   # /metrics
+    restart: unless-stopped
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # Prometheus — scrapes and stores metrics. Needs a config file to boot.
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.53.1
+    container_name: cdc-prometheus
+    hostname: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # Grafana — dashboards over Prometheus metrics.
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.1.4
+    container_name: cdc-grafana
+    hostname: grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      # Auto-provision the Prometheus datasource and the CDC dashboard on boot.
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # Alertmanager — receives firing alerts from Prometheus and routes them.
+  # ---------------------------------------------------------------------------
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: cdc-alertmanager
+    hostname: alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./config/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # alert-webhook — logs alerts from Alertmanager (local notifier stand-in).
+  # ---------------------------------------------------------------------------
+  alert-webhook:
+    build: ./monitoring/alert-webhook
+    image: cdc-pipeline/alert-webhook:0.1.0
+    container_name: cdc-alert-webhook
+    networks:
+      - cdc-net
+
+  # ---------------------------------------------------------------------------
+  # Data generator — continuous INSERT/UPDATE/DELETE workload against Postgres.
+  # Opt-in: only starts with `--profile generator`, so it never runs by accident.
+  # ---------------------------------------------------------------------------
+  generator:
+    build: ./generator
+    image: cdc-pipeline/generator:0.1.0
+    container_name: cdc-generator
+    profiles: ["generator"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      OPS_PER_SEC: 5
+    restart: unless-stopped
+    networks:
+      - cdc-net
+
+networks:
+  cdc-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  minio_data:
+  prometheus_data:
+  grafana_data:

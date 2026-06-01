@@ -1,0 +1,14 @@
+apiVersion: 1
+
+providers:
+  - name: cdc-pipeline
+    orgId: 1
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      # Dashboards are mounted here (separate from this provider config so Grafana
+      # doesn't try to parse the YAML as a dashboard).
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -1,0 +1,14 @@
+# Secrets
+.env
+# Rendered SQL with injected credentials
+flink/sql/.gen/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,35 @@
+groups:
+  - name: cdc-pipeline-alerts
+    rules:
+      # Any event in the DLQ is a failed event — alert on its presence.
+      # (Absolute value, not increase(): a one-shot counter bump that lands
+      # between scrapes anchors increase() at its first observed value, so
+      # increase() over the window reads 0 and would never fire.)
+      - alert: DLQEventsDetected
+        expr: sum by (table, reason) (cdc_dlq_events_total) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Failed CDC events in DLQ"
+          description: "{{ $value | printf \"%.0f\" }} event(s) in DLQ (table={{ $labels.table }}, reason={{ $labels.reason }})."
+
+      # Replication latency SLA breach: p99 over the 3s target.
+      - alert: HighReplicationLatency
+        expr: histogram_quantile(0.99, sum(rate(cdc_replication_latency_seconds_bucket[5m])) by (le)) > 3
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CDC replication latency p99 over 3s SLA"
+          description: "p99 replication latency is {{ $value | printf \"%.2f\" }}s (SLA < 3s)."
+
+      # Flink falling behind on the CDC topics.
+      - alert: HighConsumerLag
+        expr: sum(kafka_consumergroup_lag{consumergroup=~"flink-cdc.*"}) > 1000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High Kafka consumer lag for Flink"
+          description: "Total consumer lag is {{ $value | printf \"%.0f\" }} messages across flink-cdc groups."

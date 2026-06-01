@@ -1,0 +1,147 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": ["cdc", "debezium", "flink", "iceberg"],
+  "title": "CDC Pipeline Observability",
+  "uid": "cdc-pipeline",
+  "time": { "from": "now-15m", "to": "now" },
+  "refresh": "10s",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Replication latency p99 (all tables)",
+      "description": "DB-commit to capture. SLA target < 3s.",
+      "datasource": { "type": "prometheus", "uid": "cdcprom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 2 },
+              { "color": "red", "value": 3 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "cdcprom" },
+          "expr": "histogram_quantile(0.99, sum(rate(cdc_replication_latency_seconds_bucket[5m])) by (le))"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Per-table replication latency (p95)",
+      "datasource": { "type": "prometheus", "uid": "cdcprom" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "cdcprom" },
+          "expr": "histogram_quantile(0.95, sum(rate(cdc_replication_latency_seconds_bucket[5m])) by (le, table))",
+          "legendFormat": "{{table}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Ingestion throughput (events/sec per table)",
+      "datasource": { "type": "prometheus", "uid": "cdcprom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "cdcprom" },
+          "expr": "sum(rate(cdc_events_total[1m])) by (table)",
+          "legendFormat": "{{table}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Change mix (events/sec by op)",
+      "description": "op: c=create, u=update, d=delete, r=snapshot read",
+      "datasource": { "type": "prometheus", "uid": "cdcprom" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10, "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "cdcprom" },
+          "expr": "sum(rate(cdc_events_total[1m])) by (op)",
+          "legendFormat": "{{op}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Kafka consumer lag (Flink groups)",
+      "datasource": { "type": "prometheus", "uid": "cdcprom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "cdcprom" },
+          "expr": "sum(kafka_consumergroup_lag{consumergroup=~\"flink-cdc.*\"}) by (consumergroup)",
+          "legendFormat": "{{consumergroup}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Flink checkpoint duration (last)",
+      "description": "Exactly-once commits happen per completed checkpoint.",
+      "datasource": { "type": "prometheus", "uid": "cdcprom" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "cdcprom" },
+          "expr": "max(flink_jobmanager_job_lastCheckpointDuration)",
+          "legendFormat": "last checkpoint duration"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "DLQ events (failed, by reason)",
+      "description": "Events routed to dlq.inventory by the DLQ router.",
+      "datasource": { "type": "prometheus", "uid": "cdcprom" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 50 } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "cdcprom" },
+          "expr": "sum(increase(cdc_dlq_events_total[5m])) by (table, reason)",
+          "legendFormat": "{{table}} / {{reason}}"
+        }
+      ]
+    }
+  ]
+}
